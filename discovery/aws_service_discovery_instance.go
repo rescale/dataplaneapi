@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -35,7 +36,7 @@ import (
 
 const (
 	HAProxyServiceNameTag  = "HAProxy:Service:Name"
-	HAProxyServicePortTag  = "HAProxy:Service:Port"
+	HAProxyServicePortTag  = "HAProxy:Service:Port"  // this is going to be a comma-separated list of ports
 	HAProxyInstancePortTag = "HAProxy:Instance:Port"
 )
 
@@ -74,9 +75,12 @@ func (a awsService) Changed() bool {
 	return a.changed
 }
 
-func (a awsService) GetServers() (servers []configuration.ServiceServer) {
+func (a awsService) GetServers() map[int][]configuration.ServiceServer {
+
+	serversByPort := make(map[int][]configuration.ServiceServer)
+
 	for _, instance := range a.instances {
-		port, _ := a.instancePortFromEC2(instance)
+		ports, _ := a.instancePortFromEC2(instance)
 		var address string
 		switch a.ipv4 {
 		case models.AwsRegionIPV4AddressPrivate:
@@ -90,12 +94,16 @@ func (a awsService) GetServers() (servers []configuration.ServiceServer) {
 		if len(address) == 0 {
 			continue
 		}
-		servers = append(servers, configuration.ServiceServer{
-			Address: address,
-			Port:    port,
-		})
+
+		// Create a server entry for each port
+		for _, port := range ports {
+			serversByPort[port] = append(serversByPort[port], configuration.ServiceServer{
+				Address: address,
+				Port:    port,
+			})
+		}
 	}
-	return
+	return serversByPort
 }
 
 func newAWSRegionInstance(ctx context.Context, params *models.AwsRegion, client configuration.Configuration, reloadAgent haproxy.IReloadAgent) (*awsInstance, error) {
@@ -272,7 +280,7 @@ func (a *awsInstance) updateServices(api *ec2.Client) (err error) {
 			instanceID := aws.ToString(i.InstanceId)
 
 			if _, portErr := mapService[sn].instancePortFromEC2(i); portErr != nil {
-				a.logErrorf("unable to retrieve service port for the instance %s", *i.InstanceId)
+				a.logErrorf("unable to retrieve service ports for the instance %s", *i.InstanceId)
 
 				continue
 			}
@@ -351,13 +359,35 @@ func (a *awsInstance) stop() {
 	close(a.update)
 }
 
-func (a *awsService) instancePortFromEC2(instance types.Instance) (port int, err error) {
+func parsePortTag(portString string) ([]int, error) {
+	var ports []int
+	portStrings := strings.FieldsFunc(portString, func (r rune) bool {
+		return r == ',' || r == ' '
+	})
+	
+	for _, ps := range portStrings {
+		port, err := strconv.Atoi(ps)
+		if err != nil {
+			return nil, fmt.Errorf("invalid port value: %s", ps)
+		}
+		ports = append(ports, port)
+	}
+
+	return ports, nil
+}
+
+func (a *awsService) instancePortFromEC2(instance types.Instance) (ports []int, err error) {
 	for _, t := range instance.Tags {
 		switch {
 		case *t.Key == HAProxyServicePortTag:
-			port, err = strconv.Atoi(*t.Value)
+			ports, err = parsePortTag(*t.Value)
 		case *t.Key == HAProxyInstancePortTag:
-			return strconv.Atoi(*t.Value)
+			// Return immediately if instance-specific port is found
+			port, err := strconv.Atoi(*t.Value)
+			if err != nil {
+				return nil, err
+			}
+			return []int{port}, nil
 		}
 	}
 	return
